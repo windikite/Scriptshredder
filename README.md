@@ -1,0 +1,1 @@
+This is a python script that uses MeCab and a local dictionary to mine vocab words from japanese text and return a variety of files including a premade anki deck. 
