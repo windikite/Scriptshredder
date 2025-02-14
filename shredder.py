@@ -1,20 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Main Script for Processing ASS Subtitle Files and Generating Outputs & Anki Deck
+Main Script for Processing Japanese Text Files and Generating Outputs & Anki Deck
 
-This script processes all .ass files in the "scripts" folder:
-  - Extracts only "Default" dialogue lines.
-  - Tokenizes each dialogue line using MeCab (with UniDic).
-  - Looks up each token’s translation and kana reading using a local JSON dictionary.
-  - Only tokens with a valid translation (not "??? (Not found)") are used in final outputs;
-    unidentified tokens appear only in scrap.txt.
-  - Global duplicate filtering is applied only for the text outputs;
-    however, the JSON structure (for flashcards) is built using all non-ambiguous tokens,
-    so that up to 5 example sentences per surface variant are retained.
-  - Frequency counts are computed by normalized base form.
+This script processes all Japanese text files in the "input" folder located in the current working directory.
+It accepts files in various formats (.ass, .srt, or .txt).
+
+The script performs the following:
+  - For .ass and .srt files: Extracts only the "Default" dialogue lines.
+  - For .txt files: Reads the text content directly.
+  - Tokenizes each line using MeCab (with UniDic).
+  - Looks up each token’s English translation and kana reading using a local JSON dictionary.
+  - Only tokens with a valid translation (i.e. not "??? (Not found)") are used in final outputs;
+    tokens that cannot be translated are written to scrap.txt.
+  - Global duplicate filtering is applied for text outputs; however, the JSON structure
+    (which is used to build flashcards) is built using all non-ambiguous tokens, so that up to 5 example sentences
+    per surface variant are retained.
+  - Frequency counts are computed based on the normalized base form.
   - Only words that appear 5 or more times (by base form) are added to the Anki deck.
-  - Ambiguous tokens (pure-kana tokens whose potential_base values differ) are output to separate JSON/TXT files.
+  - Ambiguous tokens (pure-kana tokens whose normalized forms differ) are output to separate JSON and TXT files.
+
+If the "input" folder does not exist in the working directory, it will be created automatically.
+Place your .ass, .srt, or .txt Japanese text files in that folder.
 """
 
 import os
@@ -25,10 +32,10 @@ import unicodedata
 import MeCab
 from collections import defaultdict, Counter
 
-# --- Helper for resource paths ---
+# --- Helper for resource paths (for bundled files) ---
 def resource_path(relative_path):
     try:
-        base_path = sys._MEIPASS  # PyInstaller
+        base_path = sys._MEIPASS  # PyInstaller temporary folder
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
@@ -37,6 +44,13 @@ def resource_path(relative_path):
 OUTPUT_FOLDER = "output"
 if not os.path.exists(OUTPUT_FOLDER):
     os.makedirs(OUTPUT_FOLDER)
+
+# --- Input Folder (in current working directory) ---
+input_folder = os.path.join(os.getcwd(), "input")
+if not os.path.exists(input_folder):
+    os.makedirs(input_folder)
+    print(f"Created '{input_folder}' folder. Please add your .ass, .srt, or .txt files there and re-run the script.")
+    sys.exit(0)
 
 # --- MeCab Setup ---
 try:
@@ -129,27 +143,36 @@ def is_unwanted_token(surface, features):
             return True
     return False
 
-# --- ASS File Extraction ---
+# --- File Extraction ---
 def clean_ass_line(text):
     return re.sub(r'\{.*?\}', '', text).replace(r'\N', ' ').strip()
 
-def extract_dialogue_lines(ass_filename):
+def extract_dialogue_lines(filename):
     dialogue_lines = []
-    in_events = False
-    with open(ass_filename, 'r', encoding='utf-8-sig') as f:
-        for line in f:
-            line = line.rstrip('\n')
-            if line.startswith('[Events]'):
-                in_events = True
-                continue
-            if in_events and line.startswith('Dialogue:'):
-                parts = line.split(',', 9)
-                if len(parts) >= 10:
-                    style = parts[3].strip().lower()
-                    if style != "default":
-                        continue
-                    dialogue_text = clean_ass_line(parts[9])
-                    dialogue_lines.append(dialogue_text)
+    ext = os.path.splitext(filename)[1].lower()
+    with open(filename, 'r', encoding='utf-8-sig') as f:
+        if ext in ['.ass', '.srt']:
+            in_events = False
+            for line in f:
+                line = line.rstrip('\n')
+                if line.startswith('[Events]'):
+                    in_events = True
+                    continue
+                if in_events and line.startswith('Dialogue:'):
+                    parts = line.split(',', 9)
+                    if len(parts) >= 10:
+                        style = parts[3].strip().lower()
+                        if style != "default":
+                            continue
+                        dialogue_text = clean_ass_line(parts[9])
+                        dialogue_lines.append(dialogue_text)
+        elif ext == '.txt':
+            for line in f:
+                line = line.strip()
+                if line:
+                    dialogue_lines.append(line)
+        else:
+            print(f"Unsupported file format: {filename}")
     return dialogue_lines
 
 # --- Annotate Surface Word Meanings ---
@@ -169,7 +192,6 @@ def process_dialogue_line(sentence):
     Tokenize a sentence using MeCab.
     For pure kana tokens, leave base as the original surface (and record potential_base from MeCab).
     For tokens with Kanji, use normalized form (with additional normalization for verbs/adjectives).
-    Adds no dictionary variants.
     Returns tokens as tuples:
       (base, surface, base_reading, translation, surface_reading, sentence, potential_base)
     """
@@ -184,12 +206,10 @@ def process_dialogue_line(sentence):
     for surface, features, sentence in tokens:
         if is_unwanted_token(surface, features):
             continue
-
         fields = features.split(',')
         potential_base = fields[6] if len(fields) > 6 and fields[6] != "*" else surface
-
         if not contains_kanji(surface):
-            base = surface  # Delay normalization for pure kana.
+            base = surface
         else:
             base = fields[6] if len(fields) > 6 and fields[6] != "*" else surface
             if contains_kanji(surface):
@@ -205,15 +225,12 @@ def process_dialogue_line(sentence):
                 base = fields[6]
             if part_of_speech == "形容詞" and len(fields) > 6 and fields[6] != "*":
                 base = fields[6]
-
         (primary, _) = lookup_translation(base)
         translation, base_reading = primary
-
         primary_surface, _ = lookup_translation(surface)
         _, surface_reading = primary_surface
         if surface_reading == "N/A":
             surface_reading = base_reading
-
         processed.append((base, surface, base_reading, translation, surface_reading, sentence, potential_base))
     return processed
 
@@ -224,7 +241,6 @@ def build_json_structure(tokens):
     Each token is a tuple:
       (base, surface, base_reading, translation, surface_reading, sentence, potential_base, filename)
     For each surface variant, up to 5 example sentences are retained.
-    The "dictionary_variants" field is omitted.
     """
     words = {}
     for token in tokens:
@@ -275,20 +291,20 @@ def detect_ambiguous_tokens(tokens):
 
 # --- Main Execution ---
 def main():
-    scripts_folder = resource_path("scripts")
-    if not os.path.exists(scripts_folder):
-        print(f"Folder '{scripts_folder}' not found in the working directory.")
+    # Process files from the "input" folder.
+    if not os.path.exists(input_folder):
+        os.makedirs(input_folder)
+        print(f"Created '{input_folder}' folder. Please add your .ass, .srt, or .txt files there and re-run the script.")
         return
 
     global_tokens = []  # Each token: (base, surface, base_reading, translation, surface_reading, sentence, potential_base, filename)
     per_file_totals = defaultdict(int)
     scrap_by_file = defaultdict(list)
 
-    # Process each .ass file.
-    for filename in sorted(os.listdir(scripts_folder)):
-        if not filename.lower().endswith(".ass"):
+    for filename in sorted(os.listdir(input_folder)):
+        if not filename.lower().endswith((".ass", ".srt", ".txt")):
             continue
-        filepath = os.path.join(scripts_folder, filename)
+        filepath = os.path.join(input_folder, filename)
         dialogue_lines = extract_dialogue_lines(filepath)
         for line in dialogue_lines:
             tokens = process_dialogue_line(line)
@@ -301,13 +317,11 @@ def main():
                     global_tokens.append((base, surface, base_reading, translation, surface_reading, sentence, potential_base, filename))
                 per_file_totals[filename] += 1
 
-    # For flashcard and JSON structure purposes, we want to keep duplicate tokens.
-    # First, detect ambiguous tokens.
+    # Detect ambiguous tokens (for pure kana with differing potential_base values).
     ambiguous_groups, ambiguous_tokens = detect_ambiguous_tokens(global_tokens)
-    # Build non-ambiguous token list (keep all tokens that are not flagged as ambiguous).
     non_ambiguous_tokens = [token for token in global_tokens if (contains_kanji(token[1]) or token[1] not in ambiguous_groups)]
     
-    # Prepare output.txt using a deduplicated version for display purposes.
+    # For output.txt, deduplicate tokens by surface.
     global_seen = {}
     duplicates_dropped = defaultdict(int)
     final_tokens = []
@@ -335,7 +349,7 @@ def main():
         }
         out_lines.append(f"=== {fname} ===")
         out_lines.append(f"Kept initially: {stats['kept_initial']}, Duplicates dropped: {stats['duplicates_dropped']}, Final kept: {stats['final_kept']}")
-        out_lines.append("Token\tReading\tEng-reading\tSentence")
+        out_lines.append("Token\tReading\tTranslation\tSentence")
         out_lines.append("-" * 80)
         for token in sorted(file_groups.get(fname, []), key=lambda x: x[1]):
             _, surface, base_reading, translation, surface_reading, sentence, _, _ = token
@@ -350,7 +364,6 @@ def main():
     freq_counter = Counter(token[0] for token in non_ambiguous_tokens)
     freq_lines = ["Final Vocabulary Grouped by Frequency (descending):\n"]
     for base_word, count in freq_counter.most_common():
-        # Get one sample token for the base_word.
         token = next((t for t in non_ambiguous_tokens if t[0] == base_word), None)
         if token:
             base, surface, base_reading, translation, surface_reading, sentence, potential_base, filename = token
@@ -363,7 +376,7 @@ def main():
     scrap_lines = ["Scrap (Unidentified) Tokens (grouped by file):\n"]
     for fname in sorted(scrap_by_file.keys()):
         scrap_lines.append(f"=== {fname} ===")
-        scrap_lines.append("Token\tReading\tEng-reading\tSentence")
+        scrap_lines.append("Token\tReading\tTranslation\tSentence")
         scrap_lines.append("-" * 60)
         for token in sorted(scrap_by_file[fname], key=lambda x: x[3]):
             surface, surface_reading, translation, sentence = token
@@ -374,8 +387,7 @@ def main():
         f_scrap.write(scrap_output)
 
     # --- Build JSON Structure ---
-    # Use all non-ambiguous tokens (which may include duplicates) to accumulate example sentences.
-    json_tokens = non_ambiguous_tokens  # This list contains duplicates.
+    json_tokens = non_ambiguous_tokens
     json_data = build_json_structure([(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]) for t in json_tokens])
     json_output_path = os.path.join(OUTPUT_FOLDER, "output_data.json")
     with open(json_output_path, "w", encoding="utf-8") as json_file:
@@ -405,15 +417,12 @@ def main():
     print(f"Ambiguous text output written to {ambiguous_txt_path}")
 
     # --- Prepare Flashcard Entries for Anki ---
-    # Compute frequency by base form using non-ambiguous tokens.
     freq_by_base = Counter(token[0] for token in non_ambiguous_tokens)
-    # Build flashcard entries from the JSON structure.
     flashcard_entries = []
     for word in json_data["words"]:
         base_word = word["base_word"]
         if freq_by_base[base_word] < 5:
             continue
-        # Combine example sentences from all variants (up to 5 total).
         sentences = []
         for variant in word["variants"]:
             for s in variant["surface_sentences"]:
@@ -431,7 +440,6 @@ def main():
             "Frequency": freq_by_base[base_word]
         }
         flashcard_entries.append(entry)
-    # Only add cards if there is at least one.
     if flashcard_entries:
         try:
             import anki_flashcard_creator
